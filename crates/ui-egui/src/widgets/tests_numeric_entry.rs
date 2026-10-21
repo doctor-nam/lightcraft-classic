@@ -12,6 +12,7 @@ struct Harness {
     time: f64,
     rect: Rect,
     track: Rect,
+    decoy: Option<f64>,
 }
 impl Harness {
     fn new() -> Self {
@@ -23,6 +24,7 @@ impl Harness {
             time: 0.0,
             rect: Rect::NOTHING,
             track: Rect::NOTHING,
+            decoy: None,
         };
         for _ in 0..3 {
             h.frame(vec![]);
@@ -33,6 +35,12 @@ impl Harness {
         self.time += 0.02;
         let mut out = SliderOut::default();
         self.view.run(HeadlessView::raw_input(vec2(330.0, 100.0), 1.0, self.time, events), |ui| {
+            if let Some(value) = self.decoy {
+                let other = slider(ui, controls::find("light.contrast").unwrap(), value, true, None);
+                if let Some(value) = other.value {
+                    self.decoy = Some(value);
+                }
+            }
             out = slider(ui, &self.spec, self.value, self.enabled, None);
         });
         let registry = take_registry(&self.view.ctx);
@@ -194,4 +202,119 @@ fn a_disabled_value_does_not_scrub() {
     let width = h.track_width();
     assert!(h.scrub(width / 5.0, 10, false).iter().all(|o| o.value.is_none() && !o.drag_started));
     assert_eq!(h.value, 0.71);
+}
+
+impl Harness {
+    fn focus_value(&mut self) {
+        let pos = self.rect.center();
+        self.frame(vec![Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            self.frame(vec![Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE }]);
+        }
+        self.frame(vec![]);
+    }
+}
+
+#[test]
+fn focused_number_arrows_apply_immediately_and_keep_focus() {
+    let mut h = Harness::new();
+    h.focus_value();
+    let out = h.key(Key::ArrowUp);
+    assert!((out.value.unwrap() - 0.81).abs() < 1e-9);
+    assert!(h.view.painted_text().iter().any(|text| text.contains("0.81")), "the field shows the applied value");
+    if let Some(path) = std::env::var_os("NUMERIC_ENTRY_SCREENSHOT") {
+        let pixels = h.view.paint(&Default::default());
+        let image = lcc_raster::Rgba8 { width: pixels.size[0], height: pixels.size[1], data: pixels.pixels.iter().map(|c| c.to_array()).collect() };
+        let png = lcc_codecs::encode_png(&lcc_codecs::EncodeImage::rgba8(&image), &lcc_codecs::EncodeMeta::default()).unwrap();
+        std::fs::write(path, png).unwrap();
+    }
+    assert!(out.drag_started && out.drag_stopped);
+    assert!(h.view.ctx.egui_wants_keyboard_input());
+    assert!((h.key(Key::ArrowDown).value.unwrap() - 0.71).abs() < 1e-9);
+    assert!(h.key(Key::Enter).value.is_none(), "Return does not reapply a stale draft");
+}
+
+#[test]
+fn focused_number_arrows_use_the_draft_and_clamp() {
+    let mut h = Harness::new();
+    h.focus_value();
+    h.frame(vec![Event::Text("4.99".into())]);
+    assert_eq!(h.key(Key::ArrowUp).value, Some(5.0));
+    assert!(h.key(Key::ArrowUp).value.is_none());
+    assert!((h.key(Key::ArrowDown).value.unwrap() - 4.9).abs() < 1e-9);
+}
+
+#[test]
+fn exposure_shift_keeps_tenth_steps_on_repeat() {
+    let mut h = Harness::new();
+    h.focus_value();
+    let out = h.frame(vec![
+        Event::ModifiersChanged(Modifiers::SHIFT),
+        Event::Key { key: Key::ArrowUp, physical_key: None, pressed: true, repeat: true, modifiers: Modifiers::SHIFT },
+    ]);
+    assert!((out.value.unwrap() - 0.81).abs() < 1e-9);
+}
+
+#[test]
+fn exposure_ctrl_arrows_adjust_by_one_hundredth() {
+    let mut h = Harness::new();
+    h.focus_value();
+    let modifiers = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+    for (key, expected) in [(Key::ArrowUp, 0.72), (Key::ArrowDown, 0.71)] {
+        let out = h.frame(vec![Event::ModifiersChanged(modifiers), Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
+        assert!((out.value.unwrap() - expected).abs() < 1e-9);
+        assert!(h.view.ctx.egui_wants_keyboard_input());
+    }
+}
+
+#[test]
+fn other_numeric_controls_keep_shift_steps() {
+    let mut h = Harness::new();
+    h.spec = *controls::find("light.contrast").unwrap();
+    h.value = 10.0;
+    h.frame(vec![]);
+    h.focus_value();
+    assert_eq!(h.key(Key::ArrowUp).value, Some(11.0));
+    let modifiers = Modifiers::SHIFT;
+    assert_eq!(
+        h.frame(vec![
+            Event::ModifiersChanged(modifiers),
+            Event::Key { key: Key::ArrowDown, physical_key: None, pressed: true, repeat: false, modifiers }
+        ])
+        .value,
+        Some(6.0)
+    );
+}
+
+#[test]
+fn disabled_numeric_field_ignores_arrows() {
+    let mut h = Harness::new();
+    h.focus_value();
+    h.enabled = false;
+    assert!(h.key(Key::ArrowUp).value.is_none());
+    assert_eq!(h.value, 0.71);
+}
+
+#[test]
+fn escape_discards_typing_after_an_applied_nudge() {
+    let mut h = Harness::new();
+    h.focus_value();
+    h.key(Key::ArrowUp);
+    let applied = h.value;
+    h.frame(vec![Event::Text("3".into())]);
+    assert!(h.key(Key::Escape).value.is_none());
+    assert_eq!(h.value, applied);
+    assert!(h.key(Key::Enter).value.is_none());
+}
+
+#[test]
+fn focused_number_owns_arrows_while_another_slider_is_hovered() {
+    let mut h = Harness::new();
+    h.decoy = Some(10.0);
+    h.frame(vec![]);
+    h.focus_value();
+    // Contrast is the preceding row; it must not steal the focused exposure field's keys.
+    h.frame(vec![Event::PointerMoved(egui::pos2(h.track.center().x, 12.0))]);
+    assert!((h.key(Key::ArrowUp).value.unwrap() - 0.81).abs() < 1e-9);
+    assert_eq!(h.decoy, Some(10.0));
 }

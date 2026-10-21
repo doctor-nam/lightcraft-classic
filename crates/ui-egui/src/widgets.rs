@@ -406,6 +406,22 @@ fn slider_laid_out(ui: &mut Ui, spec: &ControlSpec, value: f64, enabled: bool, l
             ui.memory_mut(|m| m.request_focus(crate::text_field::id(&format!("sliderField:{}", spec.id))));
         }
         let pressed = pressed && !value_released;
+        // Consume vertical arrows before TextEdit moves its cursor. The focused number owns
+        // these keys even when the pointer is resting over a different slider.
+        let field_id = crate::text_field::id(&format!("sliderField:{}", spec.id));
+        if enabled && (frames == 0 || ui.memory(|m| m.has_focus(field_id))) {
+            let (steps, fine) = keyboard_nudges(ui, spec);
+            if steps != 0.0 {
+                let nv = keyboard_nudged(spec, typed_value(spec, &text).unwrap_or(value), steps, fine);
+                text = shown_value(spec, nv).trim_start_matches('+').to_string();
+                if (nv - value).abs() > 1e-12 {
+                    out.value = Some(nv);
+                    out.drag_started = true;
+                    out.drag_stopped = true;
+                    v = nv;
+                }
+            }
+        }
         // a child over the value, so the field never moves the rows around it
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(value_rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
         // the old value is selected when the field takes the focus, so typing replaces it
@@ -492,15 +508,21 @@ fn slider_laid_out(ui: &mut Ui, spec: &ControlSpec, value: f64, enabled: bool, l
             })
         });
         // Arrow keys work with either a hovered or a focused slider.
-        if enabled && out.value.is_none() && typing.is_none() && (ui.rect_contains_pointer(row) || resp.has_focus() || inc || dec) {
-            let (up, down, shift) = ui.input_mut(|i| {
-                let shift = i.modifiers.shift;
-                let m = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
-                (i.consume_key(m, egui::Key::ArrowUp), i.consume_key(m, egui::Key::ArrowDown), shift)
-            });
-            let (up, down) = (up || inc, down || dec);
-            if up || down {
-                let nv = nudged(spec, value, if up { 1.0 } else { -1.0 } * if shift { 5.0 } else { 1.0 });
+        if enabled
+            && out.value.is_none()
+            && typing.is_none()
+            && ((ui.rect_contains_pointer(row) && !ui.ctx().egui_wants_keyboard_input()) || resp.has_focus() || inc || dec)
+        {
+            let (steps, fine) = keyboard_nudges(ui, spec);
+            let steps = if inc {
+                1.0
+            } else if dec {
+                -1.0
+            } else {
+                steps
+            };
+            if steps != 0.0 {
+                let nv = keyboard_nudged(spec, value, steps, fine);
                 if (nv - value).abs() > 1e-12 {
                     out.value = Some(nv);
                     out.drag_started = true;
@@ -664,7 +686,32 @@ fn wheel_nudges(remainder: &mut f32, delta: f32) -> f64 {
     f64::from(steps)
 }
 
-/// `value` moved by `steps` keyboard nudges: one nudge is about 1/200 of the range, a whole
+/// Read vertical keyboard adjustments before the numeric text editor consumes them.
+fn keyboard_nudges(ui: &mut Ui, spec: &ControlSpec) -> (f64, bool) {
+    ui.input_mut(|i| {
+        let m = i.modifiers;
+        let fine = m.ctrl && spec.id == "light.exposure";
+        // On Windows egui also sets `command` when Ctrl is held.
+        if m.alt || m.mac_cmd || ((m.ctrl || m.command) && !fine) {
+            return (0.0, false);
+        }
+        let up = i.count_and_consume_key(m, egui::Key::ArrowUp);
+        let down = i.count_and_consume_key(m, egui::Key::ArrowDown);
+        let scale = if m.shift && spec.id != "light.exposure" { 5.0 } else { 1.0 };
+        ((up as f64 - down as f64) * scale, fine)
+    })
+}
+
+fn keyboard_nudged(spec: &ControlSpec, value: f64, steps: f64, fine: bool) -> f64 {
+    if spec.id == "light.exposure" {
+        let unit = if fine { 0.01 } else { 0.1 };
+        (((value + unit * steps) * 100.0).round() / 100.0).clamp(spec.min, spec.max)
+    } else {
+        nudged(spec, value, steps)
+    }
+}
+
+/// `value` moved by `steps` standard nudges: one nudge is about 1/200 of the range, a whole
 /// number of the control's steps (exposure 0.05, most sliders 1, temperature 50 K).
 pub fn nudged(spec: &ControlSpec, value: f64, steps: f64) -> f64 {
     let step = spec.step.max(1e-9);
