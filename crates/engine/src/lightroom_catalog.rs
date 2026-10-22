@@ -545,7 +545,7 @@ pub fn read(path: &Path) -> Result<CatalogImport, String> {
 }
 
 pub fn read_with_progress(path: &Path, cancel: &AtomicBool, total: &AtomicUsize, done: &AtomicUsize) -> Result<CatalogImport, String> {
-    // 14 catalog tables plus one validation stage; ImportJob adds one unit per original path.
+    // 14 catalog tables plus one validation stage; the job tracks original availability separately.
     total.store(15, Ordering::Relaxed);
     done.store(0, Ordering::Relaxed);
     ensure_read_active(cancel)?;
@@ -995,17 +995,9 @@ fn apply(s: &mut crate::Session, data: CatalogImport, update_existing: bool) -> 
     let mut index = load_index(index_path.as_deref())?;
     let archive_path = archive_dir.as_ref().map(|dir| crate::lightroom_archive::store(dir, &data).map_err(error)).transpose()?;
     let undo0 = s.undo.len();
-    let existing: HashMap<_, _> =
-        s.catalog.photos().filter(|p| p.copy_of.is_none()).filter_map(|p| source_path(p).map(|path| (key(path), p.id))).collect();
-    let paths: Vec<_> = data
-        .photos
-        .iter()
-        .filter(|p| number(&p.image, "masterImage") == 0 && !existing.contains_key(&key(&p.path)) && p.original_is_file())
-        .map(|p| p.path.clone())
-        .collect();
     let missing_sources: HashSet<String> =
         data.photos.iter().filter(|p| number(&p.image, "masterImage") == 0).filter(|p| !p.original_is_file()).map(|p| key(&p.path)).collect();
-    let files = crate::import::import(s, &paths, crate::import::ImportMode::Add)?;
+    let files = crate::import::ImportReport::default();
     let applied =
         apply_prepared(s, data, ApplyPrepared { update_existing, files, index: &mut index, archive_path, missing_sources: &missing_sources, undo0 })?;
     if let Some(path) = index_path {
@@ -1103,7 +1095,12 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
                 number(&src.image, "fileHeight").max(0) as u32,
                 &now,
             );
-            if ["RAW", "DNG", "ARW", "CR2", "CR3", "NEF", "NRW", "RAF", "ORF", "RW2", "PEF"].contains(&p.format.to_uppercase().as_str()) {
+            if [
+                "RAW", "DNG", "ARW", "CR2", "CR3", "NEF", "NRW", "RAF", "ORF", "RW2", "PEF", "SR2", "SRF", "RWL", "SRW", "IIQ", "CRW", "MRW", "X3F",
+                "KDC", "MOS", "ERF", "3FR", "FFF", "MEF",
+            ]
+            .contains(&p.format.to_uppercase().as_str())
+            {
                 p.kind = lcc_catalog::MediaKind::Raw;
             }
             p
@@ -3022,7 +3019,7 @@ mod tests {
     }
 
     #[test]
-    fn probed_original_is_counted_once_and_reimport_adds_nothing() {
+    fn present_original_is_not_probed_and_reimport_adds_nothing() {
         let dir = std::env::temp_dir().join(format!("lcc-lrcat-present-probes-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("Photos")).unwrap();
         let source = dir.join("source.lrcat");
@@ -3033,7 +3030,7 @@ mod tests {
         let calls = probes.clone();
         s.media.file_probe = Some(Arc::new(move |_| {
             calls.fetch_add(1, Ordering::Relaxed);
-            Ok(crate::media::ProbeInfo { format: "ARW".into(), width: 20, height: 10, ..Default::default() })
+            Err("catalog registration must not request original contents".into())
         }));
         for expected in [1, 0] {
             let mut job = crate::lightroom_job::LightroomJob::new(&mut s, source.clone(), false).unwrap();
@@ -3044,7 +3041,12 @@ mod tests {
             assert_eq!(completion.report["failed"], json!([]));
             assert_eq!(s.catalog.len(), 1);
         }
-        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        assert_eq!(probes.load(Ordering::Relaxed), 0, "catalog import must not read or hash originals");
+        let photo = s.catalog.photos().next().unwrap();
+        assert_eq!((photo.width, photo.height), (20, 10));
+        assert_eq!(photo.kind, lcc_catalog::MediaKind::Raw);
+        assert_eq!(photo.rating, 5);
+        assert!(photo.content_hash.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

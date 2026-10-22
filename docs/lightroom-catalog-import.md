@@ -28,7 +28,16 @@ shows the destination library, the number of records added, missing originals an
 readable in the same result window. If another dialog is open, the result waits until that dialog closes. The result
 is also available through `library.importLightroom {"status":true}` during that session.
 
-Original files are referenced in place. Ratings, picks/rejects, color labels, XMP metadata,
+Original files are referenced in place. Import registers photos from the catalog without
+reading or hashing original contents or reading adjacent XMP sidecars. This avoids transferring
+an entire NAS or cloud photo library just to add its catalog. Availability checks still access
+the filesystem, and an unreachable network share can still delay them. Thumbnails and editing
+access originals when needed. Metadata comes from the catalog and its stored XMP: EXIF absent
+there, file sizes and content hashes are not filled by this import; content-based duplicate
+matching is unavailable for these new records until originals are probed separately. Existing
+records keep their file metadata. Catalog identities and paths still prevent duplicate reimport.
+Use Photo → File → Reload from Disk (`photo.reload`) on selected photos when original-file
+metadata is needed; it reads those originals while preserving existing edits. Ratings, picks/rejects, color labels, XMP metadata,
 hierarchical keywords, regular collections/collection sets, smart collections, folder stacks,
 virtual copies and mapped develop settings are imported. Missing originals remain catalogued for relinking, count as added records and are reported
 separately from failures reading files that are present. Known-missing originals are not probed
