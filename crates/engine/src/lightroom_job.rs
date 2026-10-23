@@ -1,7 +1,7 @@
 //! Detached Lightroom catalog preparation and owner-thread commit.
 //!
 //! `LightroomJob::new` takes only an in-memory session snapshot.  `prepare` owns all catalog
-//! reading, original availability checks and archive staging, while `commit_prepared` only applies catalog operations
+//! reading, probing and archive staging, while `commit_prepared` only applies catalog operations
 //! to the session that created the job.  Archive index bytes are returned for a worker to finish
 //! after the owner has accepted the catalog operation.
 
@@ -14,8 +14,11 @@ use std::sync::{
 
 use serde_json::Value;
 
-use crate::import::{ImportMode, ImportOptions, Prepared};
+use crate::import::{ImportJob, ImportMode, ImportOptions, Prepared};
 use crate::lightroom_catalog::{self, CatalogImport, ImportIndex};
+
+mod stream;
+pub use stream::{LightroomPriority, LightroomResume};
 
 const COMMAND: &str = "library.importLightroom";
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
@@ -78,6 +81,7 @@ pub struct PreparedLightroom {
     pub(crate) missing_sources: HashSet<String>,
     pub(crate) update_existing: bool,
     pub(crate) now: String,
+    relations_only: bool,
     cancelled: bool,
 }
 
@@ -130,6 +134,7 @@ impl LightroomArchiveFinalization {
 pub struct LightroomCompletion {
     pub report: Value,
     pub finalization: LightroomArchiveFinalization,
+    index: ImportIndex,
 }
 
 /// Alias used by hosts that call the result a commit.
@@ -140,7 +145,7 @@ pub type LightroomCommit = LightroomCompletion;
 pub enum LightroomStep {
     /// Reading the catalog's tables.
     Catalog,
-    /// Checking availability of the originals without reading their contents.
+    /// Reading the photos the catalog names (headers, content hash): nearly all of the time.
     ReadPhotos,
     /// Readying the photos that were read for the catalog.
     AddPhotos,
@@ -158,10 +163,14 @@ pub struct LightroomProgress {
     add_done: Arc<AtomicUsize>,
     /// The catalog is read: the photos are next.
     photos: Arc<AtomicBool>,
+    streaming: Arc<AtomicBool>,
+    stream_total: Arc<AtomicUsize>,
+    stream_done: Arc<AtomicUsize>,
 }
 
 impl LightroomProgress {
-    /// Availability checks can be slow on network shares; keep their progress separate.
+    /// Reading the photos is nearly all of an import's time; the catalog and readying the photos
+    /// take the rest of [`LightroomProgress::fraction`].
     const CATALOG_SHARE: f32 = 0.05;
     const READ_SHARE: f32 = 0.85;
 
@@ -170,6 +179,9 @@ impl LightroomProgress {
         let load = |n: &AtomicUsize| n.load(Ordering::Relaxed);
         if !self.photos.load(Ordering::Relaxed) {
             return (LightroomStep::Catalog, load(&self.catalog_done), load(&self.catalog_total));
+        }
+        if self.streaming.load(Ordering::Relaxed) {
+            return (LightroomStep::ReadPhotos, load(&self.stream_done), load(&self.stream_total));
         }
         let (read_done, read_total) = (load(&self.read_done), load(&self.read_total));
         let (add_done, add_total) = (load(&self.add_done), load(&self.add_total));
@@ -197,7 +209,7 @@ impl LightroomProgress {
 pub struct LightroomJob {
     path: PathBuf,
     update_existing: bool,
-    now: String,
+    import: ImportJob,
     token: LightroomLibraryToken,
     archive_dir: Option<PathBuf>,
     progress: LightroomProgress,
@@ -206,15 +218,18 @@ pub struct LightroomJob {
 impl LightroomJob {
     /// Snapshot session state only.  This constructor performs no filesystem work.
     pub fn new(s: &mut crate::Session, path: PathBuf, update_existing: bool) -> crate::Result<Self> {
+        // a photo deleted here stays deleted: the catalog's record is matched, not restored
+        let opts = ImportOptions { mode: ImportMode::Add, on_deleted: crate::import::OnDeleted::Skip, ..ImportOptions::default() };
+        let import = ImportJob::new(s, opts)?;
         let archive_dir = s.library.as_ref().filter(|library| library.on_disk).map(|library| library.dir.join("Interop"));
-        Ok(Self {
-            path,
-            update_existing,
-            now: (s.clock)(),
-            token: LightroomLibraryToken::capture(s),
-            archive_dir,
-            progress: LightroomProgress::default(),
-        })
+        let progress = LightroomProgress {
+            read_total: Arc::clone(&import.read_total),
+            read_done: Arc::clone(&import.read_done),
+            add_total: Arc::clone(&import.total),
+            add_done: Arc::clone(&import.done),
+            ..LightroomProgress::default()
+        };
+        Ok(Self { path, update_existing, import, token: LightroomLibraryToken::capture(s), archive_dir, progress })
     }
 
     /// The job's progress, to watch from another thread while [`LightroomJob::prepare`] runs.
@@ -231,7 +246,7 @@ impl LightroomJob {
         finalization.finish()
     }
 
-    /// Read the catalog, check original availability and stage archives off the owner thread.
+    /// Read/probe/stage all source data off the owner thread.
     pub fn prepare(&mut self, cancel: &AtomicBool) -> crate::Result<PreparedLightroom> {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
@@ -243,21 +258,18 @@ impl LightroomJob {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
-        // The catalog already supplies dimensions, format, metadata and develop settings.
-        // Reading and hashing every original here transfers the entire photo library over
-        // the network. Register from the catalog instead, as we already do for offline files.
-        // Keep availability checks for the missing-original report, but never open originals
-        // or sidecars during preparation. Content hashes remain unknown, not fabricated.
-        self.progress.read_total.store(data.photos.len(), Ordering::Relaxed);
+        let (paths, missing_sources) = original_paths(&data, cancel)?;
+        // Catalog entries name files, never folders. Missing originals already have enough
+        // catalog metadata for placeholders; probing them again only adds failed I/O and errors.
+        // Complete the catalog step before the separate read/add photo progress starts.
         self.progress.catalog_done.fetch_add(1, Ordering::Relaxed);
         self.progress.photos.store(true, Ordering::Relaxed);
-        let missing_sources = missing_originals(&data, cancel, &self.progress.read_done)?;
+        self.import.total.fetch_add(paths.len(), Ordering::Relaxed);
+        let normal = self.import.prepare_files(paths, cancel);
         if cancel.load(Ordering::Relaxed) {
+            normal.rollback();
             return Err(cancelled());
         }
-        let normal = Prepared::default();
-        self.progress.add_total.store(data.photos.len(), Ordering::Relaxed);
-        self.progress.add_done.store(data.photos.len(), Ordering::Relaxed);
         let archive_path = stage_archive(self.archive_dir.as_deref(), &mut data)?;
         let index_path = self.archive_dir.as_ref().map(|dir| dir.join("lightroom-index.json"));
         let index = lightroom_catalog::load_index(index_path.as_deref())?;
@@ -269,7 +281,8 @@ impl LightroomJob {
             token: self.token.clone(),
             missing_sources,
             update_existing: self.update_existing,
-            now: self.now.clone(),
+            now: self.import.now().to_string(),
+            relations_only: false,
             cancelled: cancel.load(Ordering::Relaxed),
         })
     }
@@ -301,6 +314,7 @@ pub fn commit_prepared(s: &mut crate::Session, mut prepared: PreparedLightroom) 
         prepared.data,
         lightroom_catalog::ApplyPrepared {
             update_existing: prepared.update_existing,
+            relations_only: prepared.relations_only,
             files,
             index: &mut prepared.index,
             archive_path: prepared.archive_path,
@@ -310,29 +324,30 @@ pub fn commit_prepared(s: &mut crate::Session, mut prepared: PreparedLightroom) 
     )?;
     let path = prepared.token.library_dir().map(|dir| dir.join("Interop/lightroom-index.json"));
     let bytes = if path.is_some() { Some(serde_json::to_vec(&applied.index).map_err(|e| error(e.to_string()))?) } else { None };
-    Ok(LightroomCompletion { report: applied.report, finalization: LightroomArchiveFinalization { path, bytes } })
+    Ok(LightroomCompletion { index: applied.index, report: applied.report, finalization: LightroomArchiveFinalization { path, bytes } })
 }
 
-fn missing_originals(data: &CatalogImport, cancel: &AtomicBool, done: &AtomicUsize) -> crate::Result<HashSet<String>> {
+fn original_paths(data: &CatalogImport, cancel: &AtomicBool) -> crate::Result<(Vec<String>, HashSet<String>)> {
+    let mut paths = Vec::new();
     let mut missing = HashSet::new();
     let mut seen = HashSet::new();
-    for photo in &data.photos {
+    let originals: Vec<_> = data.photos.iter().filter(|p| lightroom_catalog::number_for_job(&p.image, "masterImage") == 0).collect();
+    let present = crate::import_io::map(&originals, |p| !cancel.load(Ordering::Relaxed) && p.original_is_file());
+    for (photo, exists) in originals.into_iter().zip(present) {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
-        }
-        done.fetch_add(1, Ordering::Relaxed);
-        if lightroom_catalog::number_for_job(&photo.image, "masterImage") != 0 {
-            continue;
         }
         let key = normalize(&photo.path);
         if !seen.insert(key.clone()) {
             continue;
         }
-        if !photo.original_is_file() {
+        if exists {
+            paths.push(photo.path.clone());
+        } else {
             missing.insert(key);
         }
     }
-    Ok(missing)
+    Ok((paths, missing))
 }
 
 fn normalize(path: &str) -> String {
@@ -344,7 +359,7 @@ fn normalize(path: &str) -> String {
 mod tests {
     use super::*;
 
-    fn empty_data() -> CatalogImport {
+    pub(super) fn empty_data() -> CatalogImport {
         CatalogImport {
             source: "fixture.lrcat".into(),
             photos: Vec::new(),
@@ -366,11 +381,12 @@ mod tests {
             missing_sources: HashSet::new(),
             update_existing: false,
             now: "2026-01-01T00:00:00".into(),
+            relations_only: false,
             cancelled: true,
         }
     }
 
-    fn prepared_for(s: &crate::Session, path: &str, rating: i64) -> PreparedLightroom {
+    pub(super) fn prepared_for(s: &crate::Session, path: &str, rating: i64) -> PreparedLightroom {
         let mut image = std::collections::BTreeMap::new();
         image.insert("id_local".into(), serde_json::json!(1));
         image.insert("rating".into(), serde_json::json!(rating));
@@ -406,6 +422,7 @@ mod tests {
             missing_sources: [normalize(path)].into_iter().collect(),
             update_existing: false,
             now: "2026-01-01T00:00:00".into(),
+            relations_only: false,
             cancelled: false,
         }
     }
@@ -548,6 +565,7 @@ mod tests {
             missing_sources: HashSet::new(),
             update_existing: false,
             now: "2026-01-01T00:00:00".into(),
+            relations_only: false,
             cancelled: false,
         };
         let completion = commit_prepared(&mut session, prepared).unwrap();
@@ -597,6 +615,7 @@ mod tests {
             missing_sources: HashSet::new(),
             update_existing: false,
             now: "2026-01-01T00:00:00".into(),
+            relations_only: false,
             cancelled: false,
         };
         let completion = commit_prepared(&mut session, prepared).unwrap();

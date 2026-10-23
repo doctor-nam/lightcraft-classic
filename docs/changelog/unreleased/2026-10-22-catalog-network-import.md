@@ -1,3 +1,3 @@
-## Performance
+## Import
 
-- Lightroom catalog import registers photos using catalog metadata without reading and hashing every original. This avoids transferring the entire photo library from a NAS or cloud folder. Original availability is still checked; metadata absent from the catalog and content hashes are not populated during import.
+- Restored original-file probing and adjacent XMP reads during Lightroom catalog import. Skipping those reads could omit camera and lens information needed to interpret edits. Import fidelity takes priority over the catalog-only speed optimization; network imports may take longer again. This restores the previous import behavior, not identical rendering to Lightroom.

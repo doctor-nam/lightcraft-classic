@@ -230,8 +230,29 @@ impl Catalog {
         ops
     }
 
-    /// The library's volumes with their folders and photo counts: volumes by name
-    /// (case-insensitive), each folder with its subfolders the same way.
+    /// Announce folders without creating photos or journal entries. Cleared by the import host.
+    pub fn set_import_folders(&mut self, folders: std::collections::BTreeSet<String>) {
+        if *self.import_folders == folders {
+            return;
+        }
+        self.forget_other_past();
+        self.import_folders = std::sync::Arc::new(folders);
+        self.revision = self.revision.saturating_add(1);
+        self.changes.broad = self.revision;
+        self.changes.seen = self.revision;
+    }
+
+    /// Announced folders may be selected before any original has finished loading.
+    pub fn has_import_folder(&self, path: &str) -> bool {
+        let key = folder_key(path);
+        !key.is_empty() && self.import_folders.iter().any(|p| key_within(&folder_key(p), &key))
+    }
+
+    pub fn has_import_folders(&self) -> bool {
+        !self.import_folders.is_empty()
+    }
+
+    /// Library volumes and announced folders, with counts of fully registered photos only.
     pub fn folder_tree(&self) -> Vec<FolderNode> {
         // photos per containing folder, as spelled (sorted, so the spelling that names a folder
         // never depends on hash order)
@@ -244,6 +265,9 @@ impl Catalog {
             {
                 *dirs.entry(dir).or_default() += 1;
             }
+        }
+        for dir in self.import_folders.iter() {
+            dirs.entry(dir.as_str()).or_default();
         }
         let mut levels: HashMap<String, Level> = HashMap::new();
         let mut roots: Vec<String> = Vec::new();

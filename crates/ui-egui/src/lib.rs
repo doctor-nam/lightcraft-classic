@@ -1991,14 +1991,17 @@ impl Caches {
         }
         // a catalog change lists the disk folders again: a folder created, moved or removed changes no
         // photo, so the catalog's own record of what changed can't tell
-        if self.folder_tree.as_ref().is_none_or(|((r, _), _)| *r != cat.revision) {
+        if !cat.has_import_folders() && self.folder_tree.as_ref().is_none_or(|((r, _), _)| *r != cat.revision) {
             crate::panels::left::classic::invalidate_disk_folders();
         }
         // the catalog's part is made again only when a photo's file or presence changed
         let base = self.folder_base.take().filter(|(r, _)| still_right(cat, *r, READS_FILE)).map(|(_, b)| b);
         let base = base.unwrap_or_else(|| std::sync::Arc::new(crate::panels::left::sidebar_folders(cat.folder_tree())));
         self.folder_base = Some((cat.revision, base.clone()));
-        let t = std::sync::Arc::new(crate::panels::left::classic::with_disk_folders(base.as_ref().clone()));
+        // The catalog already supplies the complete import tree. Do not enumerate NAS
+        // directories again after every accepted batch.
+        let t =
+            if cat.has_import_folders() { base } else { std::sync::Arc::new(crate::panels::left::classic::with_disk_folders(base.as_ref().clone())) };
         self.folder_tree = Some((key, t.clone()));
         t
     }

@@ -28,16 +28,42 @@ shows the destination library, the number of records added, missing originals an
 readable in the same result window. If another dialog is open, the result waits until that dialog closes. The result
 is also available through `library.importLightroom {"status":true}` during that session.
 
-Original files are referenced in place. Import registers photos from the catalog without
-reading or hashing original contents or reading adjacent XMP sidecars. This avoids transferring
-an entire NAS or cloud photo library just to add its catalog. Availability checks still access
-the filesystem, and an unreachable network share can still delay them. Thumbnails and editing
-access originals when needed. Metadata comes from the catalog and its stored XMP: EXIF absent
-there, file sizes and content hashes are not filled by this import; content-based duplicate
-matching is unavailable for these new records until originals are probed separately. Existing
-records keep their file metadata. Catalog identities and paths still prevent duplicate reimport.
-Use Photo → File → Reload from Disk (`photo.reload`) on selected photos when original-file
-metadata is needed; it reads those originals while preserving existing edits. Ratings, picks/rejects, color labels, XMP metadata,
+The desktop first reads the root, folder, file and image tables and announces the entire folder
+list before reading develop/history tables or probing originals. These transient folders can be
+selected immediately; counts represent registered photos, so an unloaded folder initially shows
+zero. Selecting it prioritizes its originals. Cancellation or failure removes the transient entries
+while retaining completed photos. Pending entries are never saved as completed library records.
+During this phase the sidebar uses the catalog paths instead of repeatedly enumerating directories
+on the network share.
+
+Independent original-existence checks, XMP candidate reads and XMP stamp checks run on a bounded
+pool of eight I/O workers. Candidate precedence, RAW/JPEG ownership, embedded XMP fallback and
+original probing remain intact; no long-lived directory cache can hide a newly added sidecar.
+This overlaps network round trips; it does not reduce the bytes required for content hashes.
+A synthetic delayed-request test reports serial and parallel timings, not a measured throughput
+claim for Sony A7 II ARW files over a user's Samba server. On 2026-10-22, 32 synthetic
+10 ms requests took 322 ms serially and 41 ms on the bounded pool; all results and input order
+were preserved (`import_io::tests::lightroom_network_requests_overlap_without_reordering_or_omission`).
+
+The desktop imports in small batches (normally 16 records). The selected photo, grid viewport
+(including its nearby prefetch rows), and current folder are prioritized, in that order. Changing
+folders reprioritizes the next batch; a file read already in progress must finish or report an error.
+RAW/JPEG sidecar partners and virtual copies stay with their master, even when that makes a batch
+larger. Completed batches are available before the whole import finishes. Each batch is a separate
+undo step, so an intervening user edit is not swallowed by the import's undo history.
+
+The remaining catalog tables and recovery archive are read/staged after the folder announcement and before the first batch. Collections and
+stacks are linked after the photos finish, without reapplying their settings. Cancel or failure
+keeps accepted batches and reports how many photos were added; reimport uses the saved identity
+index. The CLI's noninteractive import still prepares all photos before committing. This scheduling
+improves time to use the current folder; it does not eliminate NAS transfer time or establish a
+throughput gain on a particular network.
+
+Original files are referenced in place. Import fidelity takes priority over throughput: available
+originals are probed and their applicable sidecars are read before catalog settings are mapped.
+Camera and lens information must not be omitted merely to speed up network imports. Performance
+changes need equivalent imported metadata and develop settings to the full-probe path; matching
+those values alone still does not prove matching rendered output to Lightroom. Ratings, picks/rejects, color labels, XMP metadata,
 hierarchical keywords, regular collections/collection sets, smart collections, folder stacks,
 virtual copies and mapped develop settings are imported. Missing originals remain catalogued for relinking, count as added records and are reported
 separately from failures reading files that are present. Known-missing originals are not probed

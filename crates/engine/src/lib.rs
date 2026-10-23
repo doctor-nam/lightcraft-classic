@@ -51,6 +51,7 @@ pub mod fonts;
 pub mod guard;
 pub mod history_groups;
 pub mod import;
+mod import_io;
 mod import_move;
 pub mod legacy;
 pub mod lens_download;
@@ -1330,7 +1331,8 @@ impl Session {
     /// shows.
     fn folder_holds_photos(&self) -> bool {
         let f = Filter { library_folder: self.library_folder.clone(), ..Default::default() };
-        self.library_folder.is_some() && !self.catalog.query(&f, &Sort::default()).is_empty()
+        self.library_folder.as_deref().is_some_and(|path| self.catalog.has_import_folder(path))
+            || (self.library_folder.is_some() && !self.catalog.query(&f, &Sort::default()).is_empty())
     }
 
     /// Photos in the current source (folder, album, …) before the filter bar and search narrow

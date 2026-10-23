@@ -379,6 +379,7 @@ fn show_inner(app: &mut LccApp, ui: &mut egui::Ui) {
         }
     });
     app.caches.grid_stats.cells_visited += visited;
+    crate::lightroom_import::prioritize_visible(app, &visible_ids);
     app.renderer.evict_thumbs(&visible_ids, 600);
     let _ = (Color32::BLACK, StrokeKind::Inside, Stroke::NONE);
 }

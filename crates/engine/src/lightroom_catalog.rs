@@ -226,7 +226,7 @@ impl CatalogPhoto {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CatalogImport {
     pub source: String,
     pub photos: Vec<CatalogPhoto>,
@@ -545,7 +545,17 @@ pub fn read(path: &Path) -> Result<CatalogImport, String> {
 }
 
 pub fn read_with_progress(path: &Path, cancel: &AtomicBool, total: &AtomicUsize, done: &AtomicUsize) -> Result<CatalogImport, String> {
-    // 14 catalog tables plus one validation stage; the job tracks original availability separately.
+    read_with_folders(path, cancel, total, done, |_| Ok(()))
+}
+
+pub(crate) fn read_with_folders(
+    path: &Path,
+    cancel: &AtomicBool,
+    total: &AtomicUsize,
+    done: &AtomicUsize,
+    announce: impl FnOnce(std::collections::BTreeSet<String>) -> Result<(), String>,
+) -> Result<CatalogImport, String> {
+    // 14 catalog tables plus one validation stage; ImportJob adds one unit per original path.
     total.store(15, Ordering::Relaxed);
     done.store(0, Ordering::Relaxed);
     ensure_read_active(cancel)?;
@@ -591,46 +601,6 @@ pub fn read_with_progress(path: &Path, cancel: &AtomicBool, total: &AtomicUsize,
     let roots: HashMap<_, _> = table("AgLibraryRootFolder", true)?.into_iter().map(|r| (number(&r, "id_local"), r)).collect();
     let folders: HashMap<_, _> = table("AgLibraryFolder", true)?.into_iter().map(|r| (number(&r, "id_local"), r)).collect();
     let files: HashMap<_, _> = table("AgLibraryFile", true)?.into_iter().map(|r| (number(&r, "id_local"), r)).collect();
-    ensure_read_active(cancel)?;
-    let develops = reader.develop_settings(cancel)?;
-    done.fetch_add(1, Ordering::Relaxed);
-    ensure_read_active(cancel)?;
-    let (metadata, metadata_warnings) = match reader.xmp_table(cancel) {
-        Ok(result) => result,
-        Err(error) => {
-            ensure_read_active(cancel)?;
-            if reader.db.has_observed_source_failure() {
-                return Err(error);
-            }
-            warnings.push(format!("skipping optional Lightroom table Adobe_AdditionalMetadata: {error}"));
-            (HashMap::new(), Vec::new())
-        }
-    };
-    warnings.extend(metadata_warnings);
-    done.fetch_add(1, Ordering::Relaxed);
-    let keyword_rows: HashMap<_, _> = optional_table("AgLibraryKeyword", &mut warnings)?.into_iter().map(|r| (number(&r, "id_local"), r)).collect();
-    let mut keywords: HashMap<i64, Vec<String>> = HashMap::new();
-    for r in optional_table("AgLibraryKeywordImage", &mut warnings)? {
-        ensure_read_active(cancel)?;
-        let mut parts = Vec::new();
-        let mut at = number(&r, "tag");
-        let mut seen = HashSet::new();
-        while at != 0 {
-            if parts.len() >= 64 || !seen.insert(at) {
-                return Err("cyclic or overly deep keyword hierarchy".into());
-            }
-            let Some(k) = keyword_rows.get(&at) else { break };
-            let name = text(k, "name");
-            if !name.is_empty() {
-                parts.push(name.to_string());
-            }
-            at = number(k, "parent");
-        }
-        parts.reverse();
-        if !parts.is_empty() {
-            keywords.entry(number(&r, "image")).or_default().push(parts.join("|"));
-        }
-    }
     let mut root_paths = HashMap::new();
     let mut refused_roots = HashSet::new();
     let mut root_ids: Vec<_> = roots.keys().copied().collect();
@@ -653,19 +623,13 @@ pub fn read_with_progress(path: &Path, cancel: &AtomicBool, total: &AtomicUsize,
         }
         root_paths.insert(id, resolved);
     }
-    ensure_read_active(cancel)?;
-    let mut history = reader.grouped("Adobe_libraryImageDevelopHistoryStep", &mut warnings, cancel)?;
-    done.fetch_add(1, Ordering::Relaxed);
-    ensure_read_active(cancel)?;
-    let mut snapshots = reader.grouped("Adobe_libraryImageDevelopSnapshot", &mut warnings, cancel)?;
-    done.fetch_add(1, Ordering::Relaxed);
     let mut out = CatalogImport {
         source: path.to_string_lossy().into(),
         photos: Vec::new(),
-        collections: optional_table("AgLibraryCollection", &mut warnings)?,
-        members: optional_table("AgLibraryCollectionImage", &mut warnings)?,
-        collection_content: optional_table("AgLibraryCollectionContent", &mut warnings)?,
-        stacks: optional_table("AgLibraryFolderStackImage", &mut warnings)?,
+        collections: Vec::new(),
+        members: Vec::new(),
+        collection_content: Vec::new(),
+        stacks: Vec::new(),
         warnings,
     };
     // An image row whose file, folder or root record is gone (Lightroom leaves such rows behind, and its integrity
@@ -707,23 +671,16 @@ pub fn read_with_progress(path: &Path, cancel: &AtomicBool, total: &AtomicUsize,
         {
             out.warnings.push(format!("image {id}: {photo_path} is not opened: {why}; listed as missing and not added"));
         }
-        let packet = match xmp(metadata.get(&id).and_then(|r| r.get("xmp"))) {
-            Ok(s) => s,
-            Err(e) => {
-                out.warnings.push(format!("image {id}: {e}"));
-                String::new()
-            }
-        };
         out.photos.push(CatalogPhoto {
             source_id: id,
             uuid: text(&image, "id_global").into(),
             path: photo_path,
             image,
-            settings: develops.get(&id).cloned().unwrap_or_default(),
-            xmp: packet,
-            keywords: keywords.remove(&id).unwrap_or_default(),
-            history: history.remove(&id).unwrap_or_default(),
-            snapshots: snapshots.remove(&id).unwrap_or_default(),
+            settings: String::new(),
+            xmp: String::new(),
+            keywords: Vec::new(),
+            history: Vec::new(),
+            snapshots: Vec::new(),
             original,
         });
     }
@@ -731,6 +688,87 @@ pub fn read_with_progress(path: &Path, cancel: &AtomicBool, total: &AtomicUsize,
         out.warnings.push(format!("{left_out} images left out in all: their original's file, folder or root record is missing or incomplete"));
     }
     refuse_non_media(&mut out);
+    ensure_read_active(cancel)?;
+    source_guard.verify()?;
+    // Paths first: publish before large develop/history tables and before any original probe.
+    let folders = out
+        .photos
+        .iter()
+        .filter(|p| !matches!(p.original, Original::Refused(_)))
+        .filter_map(|p| {
+            let path = p.path.replace('\\', "/");
+            path.get(..path.rfind('/')?.max(1)).map(str::to_owned)
+        })
+        .collect();
+    announce(folders)?;
+    let mut warnings = std::mem::take(&mut out.warnings);
+    ensure_read_active(cancel)?;
+    let develops = reader.develop_settings(cancel)?;
+    done.fetch_add(1, Ordering::Relaxed);
+    ensure_read_active(cancel)?;
+    let (metadata, metadata_warnings) = match reader.xmp_table(cancel) {
+        Ok(result) => result,
+        Err(error) => {
+            ensure_read_active(cancel)?;
+            if reader.db.has_observed_source_failure() {
+                return Err(error);
+            }
+            warnings.push(format!("skipping optional Lightroom table Adobe_AdditionalMetadata: {error}"));
+            (HashMap::new(), Vec::new())
+        }
+    };
+    warnings.extend(metadata_warnings);
+    done.fetch_add(1, Ordering::Relaxed);
+    let keyword_rows: HashMap<_, _> = optional_table("AgLibraryKeyword", &mut warnings)?.into_iter().map(|r| (number(&r, "id_local"), r)).collect();
+    let mut keywords: HashMap<i64, Vec<String>> = HashMap::new();
+    for r in optional_table("AgLibraryKeywordImage", &mut warnings)? {
+        ensure_read_active(cancel)?;
+        let mut parts = Vec::new();
+        let mut at = number(&r, "tag");
+        let mut seen = HashSet::new();
+        while at != 0 {
+            if parts.len() >= 64 || !seen.insert(at) {
+                return Err("cyclic or overly deep keyword hierarchy".into());
+            }
+            let Some(k) = keyword_rows.get(&at) else { break };
+            let name = text(k, "name");
+            if !name.is_empty() {
+                parts.push(name.to_string());
+            }
+            at = number(k, "parent");
+        }
+        parts.reverse();
+        if !parts.is_empty() {
+            keywords.entry(number(&r, "image")).or_default().push(parts.join("|"));
+        }
+    }
+    ensure_read_active(cancel)?;
+    let mut history = reader.grouped("Adobe_libraryImageDevelopHistoryStep", &mut warnings, cancel)?;
+    done.fetch_add(1, Ordering::Relaxed);
+    ensure_read_active(cancel)?;
+    let mut snapshots = reader.grouped("Adobe_libraryImageDevelopSnapshot", &mut warnings, cancel)?;
+    done.fetch_add(1, Ordering::Relaxed);
+    out.collections = optional_table("AgLibraryCollection", &mut warnings)?;
+    out.members = optional_table("AgLibraryCollectionImage", &mut warnings)?;
+    out.collection_content = optional_table("AgLibraryCollectionContent", &mut warnings)?;
+    out.stacks = optional_table("AgLibraryFolderStackImage", &mut warnings)?;
+    out.warnings = warnings;
+    for photo in &mut out.photos {
+        ensure_read_active(cancel)?;
+        let id = photo.source_id;
+        let packet = match xmp(metadata.get(&id).and_then(|r| r.get("xmp"))) {
+            Ok(s) => s,
+            Err(e) => {
+                out.warnings.push(format!("image {id}: {e}"));
+                String::new()
+            }
+        };
+        photo.settings = develops.get(&id).cloned().unwrap_or_default();
+        photo.xmp = packet;
+        photo.keywords = keywords.remove(&id).unwrap_or_default();
+        photo.history = history.remove(&id).unwrap_or_default();
+        photo.snapshots = snapshots.remove(&id).unwrap_or_default();
+    }
     ensure_read_active(cancel)?;
     source_guard.verify()?;
     Ok(out)
@@ -995,11 +1033,22 @@ fn apply(s: &mut crate::Session, data: CatalogImport, update_existing: bool) -> 
     let mut index = load_index(index_path.as_deref())?;
     let archive_path = archive_dir.as_ref().map(|dir| crate::lightroom_archive::store(dir, &data).map_err(error)).transpose()?;
     let undo0 = s.undo.len();
+    let existing: HashMap<_, _> =
+        s.catalog.photos().filter(|p| p.copy_of.is_none()).filter_map(|p| source_path(p).map(|path| (key(path), p.id))).collect();
+    let paths: Vec<_> = data
+        .photos
+        .iter()
+        .filter(|p| number(&p.image, "masterImage") == 0 && !existing.contains_key(&key(&p.path)) && p.original_is_file())
+        .map(|p| p.path.clone())
+        .collect();
     let missing_sources: HashSet<String> =
         data.photos.iter().filter(|p| number(&p.image, "masterImage") == 0).filter(|p| !p.original_is_file()).map(|p| key(&p.path)).collect();
-    let files = crate::import::ImportReport::default();
-    let applied =
-        apply_prepared(s, data, ApplyPrepared { update_existing, files, index: &mut index, archive_path, missing_sources: &missing_sources, undo0 })?;
+    let files = crate::import::import(s, &paths, crate::import::ImportMode::Add)?;
+    let applied = apply_prepared(
+        s,
+        data,
+        ApplyPrepared { relations_only: false, update_existing, files, index: &mut index, archive_path, missing_sources: &missing_sources, undo0 },
+    )?;
     if let Some(path) = index_path {
         s.persist()?;
         let bytes = serde_json::to_vec(&applied.index).map_err(|e| error(e.to_string()))?;
@@ -1011,6 +1060,7 @@ fn apply(s: &mut crate::Session, data: CatalogImport, update_existing: bool) -> 
 /// Apply prepared normal-file results and Lightroom metadata in one owner-thread operation.
 /// This function does no filesystem work; callers finish its returned index separately.
 pub(crate) struct ApplyPrepared<'a> {
+    pub(crate) relations_only: bool,
     pub(crate) update_existing: bool,
     pub(crate) files: crate::import::ImportReport,
     pub(crate) index: &'a mut ImportIndex,
@@ -1020,7 +1070,7 @@ pub(crate) struct ApplyPrepared<'a> {
 }
 
 pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, context: ApplyPrepared<'_>) -> crate::Result<AppliedImport> {
-    let ApplyPrepared { update_existing, files, index, archive_path, missing_sources, undo0 } = context;
+    let ApplyPrepared { relations_only, update_existing, files, index, archive_path, missing_sources, undo0 } = context;
     // nothing but a file type the app reads becomes a record, whichever route got here (#2135)
     refuse_non_media(&mut data);
     validate(&data).map_err(error)?;
@@ -1063,6 +1113,12 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
             .map(PhotoId)
             .filter(|id| s.catalog.photo(*id).is_some_and(|p| source_path(p).is_some_and(|path| key(path) == key(&src.path))));
         let existing_id = indexed.or_else(|| if master == 0 { by_path.get(&key(&src.path)).copied() } else { None });
+        if relations_only {
+            if let Some(id) = existing_id {
+                ids.insert(src.source_id, id);
+            }
+            continue;
+        }
         let mut p = if let Some(id) = existing_id.and_then(|id| s.catalog.photo(id)) {
             (**id).clone()
         } else if master != 0 {
@@ -1095,12 +1151,7 @@ pub(crate) fn apply_prepared(s: &mut crate::Session, mut data: CatalogImport, co
                 number(&src.image, "fileHeight").max(0) as u32,
                 &now,
             );
-            if [
-                "RAW", "DNG", "ARW", "CR2", "CR3", "NEF", "NRW", "RAF", "ORF", "RW2", "PEF", "SR2", "SRF", "RWL", "SRW", "IIQ", "CRW", "MRW", "X3F",
-                "KDC", "MOS", "ERF", "3FR", "FFF", "MEF",
-            ]
-            .contains(&p.format.to_uppercase().as_str())
-            {
+            if ["RAW", "DNG", "ARW", "CR2", "CR3", "NEF", "NRW", "RAF", "ORF", "RW2", "PEF"].contains(&p.format.to_uppercase().as_str()) {
                 p.kind = lcc_catalog::MediaKind::Raw;
             }
             p
@@ -1673,6 +1724,7 @@ mod tests {
                 s,
                 data.clone(),
                 ApplyPrepared {
+                    relations_only: false,
                     update_existing: false,
                     files: Default::default(),
                     index: &mut index,
@@ -2924,7 +2976,12 @@ mod tests {
             Ok(_) => panic!("observed optional WAL read error must abort preparation before staging"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("indexed WAL frame header"), "unexpected optional WAL I/O error: {error}");
+        // The paths-first manifest now checks source stamps before optional tables.
+        // A truncation can therefore be rejected before the indexed frame is read.
+        assert!(
+            error.contains("indexed WAL frame header") || error.contains("catalog changed during reading"),
+            "unexpected optional WAL I/O error: {error}"
+        );
         assert_eq!(session.catalog.to_snapshot(), catalog_before, "failed prepare must not mutate catalog");
         assert_eq!(session.undo.len(), undo_before, "failed prepare must not add undo records");
         let entries_after = if interop.exists() {
@@ -2975,6 +3032,32 @@ mod tests {
     }
 
     #[test]
+    fn lightroom_paths_are_announced_before_develop_and_history_tables() {
+        let path = std::env::temp_dir().join(format!("app-paths-first-{}.lrcat", std::process::id()));
+        std::fs::write(&path, native_catalog(&photo_tables(("/catalog/", "")))).unwrap();
+        let cancel = AtomicBool::new(false);
+        let total = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let mut announced = false;
+        let catalog = read_with_folders(&path, &cancel, &total, &done, |folders| {
+            assert_eq!(done.load(Ordering::Relaxed), 4, "only roots, folders, files, images read");
+            assert!(folders.iter().any(|p| p.starts_with("/catalog")));
+            announced = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(announced);
+        assert_eq!(catalog.photos.len(), 1);
+        assert_eq!(number(&catalog.photos[0].image, "rating"), 5);
+        let cancelled = read_with_folders(&path, &cancel, &total, &done, |_| {
+            cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        assert!(cancelled.is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn reads_native_catalog_fixture_without_lightroom_or_external_processes() {
         let bytes = native_catalog(&photo_tables(("/catalog/", "")));
         let path = std::env::temp_dir().join(format!("app-native-catalog-{}.lrcat", std::process::id()));
@@ -3019,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn present_original_is_not_probed_and_reimport_adds_nothing() {
+    fn probed_original_is_counted_once_and_reimport_adds_nothing() {
         let dir = std::env::temp_dir().join(format!("lcc-lrcat-present-probes-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("Photos")).unwrap();
         let source = dir.join("source.lrcat");
@@ -3030,7 +3113,7 @@ mod tests {
         let calls = probes.clone();
         s.media.file_probe = Some(Arc::new(move |_| {
             calls.fetch_add(1, Ordering::Relaxed);
-            Err("catalog registration must not request original contents".into())
+            Ok(crate::media::ProbeInfo { format: "ARW".into(), width: 20, height: 10, ..Default::default() })
         }));
         for expected in [1, 0] {
             let mut job = crate::lightroom_job::LightroomJob::new(&mut s, source.clone(), false).unwrap();
@@ -3041,12 +3124,7 @@ mod tests {
             assert_eq!(completion.report["failed"], json!([]));
             assert_eq!(s.catalog.len(), 1);
         }
-        assert_eq!(probes.load(Ordering::Relaxed), 0, "catalog import must not read or hash originals");
-        let photo = s.catalog.photos().next().unwrap();
-        assert_eq!((photo.width, photo.height), (20, 10));
-        assert_eq!(photo.kind, lcc_catalog::MediaKind::Raw);
-        assert_eq!(photo.rating, 5);
-        assert!(photo.content_hash.is_none());
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

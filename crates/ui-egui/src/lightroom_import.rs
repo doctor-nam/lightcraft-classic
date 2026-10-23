@@ -21,16 +21,16 @@ enum Kind {
 }
 
 enum Message {
+    Folders(std::collections::BTreeSet<String>, lcc_engine::lightroom_job::LightroomLibraryToken, mpsc::Sender<Result<(), String>>),
     Inspected(Result<Value, String>),
-    Prepared(Result<Box<lcc_engine::lightroom_job::PreparedLightroom>, String>),
-    Finalized(Result<(), String>),
+    Batch(Box<lcc_engine::lightroom_job::PreparedLightroom>, mpsc::Sender<Result<lcc_engine::lightroom_job::LightroomResume, String>>),
+    Finished(Result<(), String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Reading,
     Committing,
-    Finalizing,
 }
 
 /// A Lightroom task in flight.  The receiver is polled from the egui owner thread; the activity stack shows it.
@@ -43,6 +43,8 @@ pub struct LightroomTask {
     phase: Phase,
     cancelled: bool,
     guard: TaskGuard,
+    priority: lcc_engine::lightroom_job::LightroomPriority,
+    partial: Value,
 }
 
 impl LightroomTask {
@@ -60,7 +62,18 @@ impl LightroomTask {
             Kind::Import => "Importing Lightroom catalog",
         };
         let guard = s.activity.start("lightroom", label, Cancel::Flag(cancel.clone()));
-        let task = Self { kind, path, cancel, progress, rx, phase: Phase::Reading, cancelled: false, guard };
+        let task = Self {
+            kind,
+            path,
+            cancel,
+            progress,
+            rx,
+            phase: Phase::Reading,
+            cancelled: false,
+            guard,
+            priority: Default::default(),
+            partial: json!({}),
+        };
         task.refresh();
         task
     }
@@ -83,7 +96,6 @@ impl LightroomTask {
             (Phase::Reading, Kind::Import, LightroomStep::ReadPhotos) => crate::i18n::tr("Reading photos…"),
             (Phase::Reading, Kind::Import, LightroomStep::AddPhotos) => crate::i18n::tr("Adding photos…"),
             (Phase::Committing, ..) => crate::i18n::tr("Adding Lightroom photos…"),
-            (Phase::Finalizing, ..) => crate::i18n::tr("Saving Lightroom import index…"),
         };
         if self.phase == Phase::Reading {
             self.guard.progress(done as u64, total as u64);
@@ -102,7 +114,6 @@ impl LightroomTask {
         let phase = match self.phase {
             Phase::Reading => "reading",
             Phase::Committing => "committing",
-            Phase::Finalizing => "finalizing",
         };
         let (step, done, total) = self.progress.step();
         let step = match step {
@@ -119,6 +130,7 @@ impl LightroomTask {
             "done": done,
             "total": total,
             "fraction": self.progress.fraction(),
+            "imported": self.partial["imported"].as_u64().unwrap_or(0),
             "cancelled": self.cancelled || self.cancel.load(Ordering::Relaxed),
         })
     }
@@ -181,6 +193,7 @@ fn spawn_inspect(
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_prepare(
     mut job: lcc_engine::lightroom_job::LightroomJob,
+    priority: lcc_engine::lightroom_job::LightroomPriority,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<Message>,
     ctx: egui::Context,
@@ -188,44 +201,39 @@ fn spawn_prepare(
     std::thread::Builder::new()
         .name("lc-lightroom-import".into())
         .spawn(move || {
-            let result =
-                lcc_engine::guard::catch("Lightroom import", || job.prepare(&cancel)).and_then(|r| r.map(Box::new).map_err(|e| e.to_string()));
-            if let Err(mpsc::SendError(Message::Prepared(Ok(prepared)))) = tx.send(Message::Prepared(result)) {
-                // The owner dropped the task (for example while closing): staged copies/moves
-                // must be put back even though no UI receiver remains to accept the result.
-                prepared.rollback();
-            }
+            let result = lcc_engine::guard::catch("Lightroom import", || {
+                let token = job.token().clone();
+                job.prepare_with_folders(
+                    &cancel,
+                    &priority,
+                    |folders| {
+                        let (ack, rx) = mpsc::channel();
+                        tx.send(Message::Folders(folders, token, ack))
+                            .map_err(|_| lcc_engine::EngineError::Cancelled("Lightroom owner closed".into()))?;
+                        ctx.request_repaint();
+                        rx.recv()
+                            .map_err(|_| lcc_engine::EngineError::Cancelled("Lightroom owner closed".into()))?
+                            .map_err(lcc_engine::EngineError::Cancelled)
+                    },
+                    |prepared| {
+                        let (ack, rx) = mpsc::channel();
+                        if let Err(mpsc::SendError(Message::Batch(prepared, _))) = tx.send(Message::Batch(Box::new(prepared), ack)) {
+                            prepared.rollback();
+                            return Err(lcc_engine::EngineError::Cancelled("Lightroom owner closed".into()));
+                        }
+                        ctx.request_repaint();
+                        rx.recv()
+                            .map_err(|e| lcc_engine::EngineError::BadParams { cmd: "library.importLightroom".into(), msg: e.to_string() })?
+                            .map_err(|msg| lcc_engine::EngineError::BadParams { cmd: "library.importLightroom".into(), msg })
+                    },
+                )
+            })
+            .and_then(|r| r.map_err(|e| e.to_string()));
+            let _ = tx.send(Message::Finished(result));
             ctx.request_repaint();
         })
         .map(|_| ())
         .map_err(|e| format!("could not start Lightroom import: {e}"))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_finalize(
-    finalization: lcc_engine::lightroom_job::LightroomArchiveFinalization,
-    tx: mpsc::Sender<Message>,
-    ctx: egui::Context,
-) -> Result<(), String> {
-    std::thread::Builder::new()
-        .name("lc-lightroom-finalize".into())
-        .spawn(move || {
-            let result =
-                lcc_engine::guard::catch("Lightroom archive finalization", || finalization.finish()).and_then(|r| r.map_err(|e| e.to_string()));
-            let _ = tx.send(Message::Finalized(result));
-            ctx.request_repaint();
-        })
-        .map(|_| ())
-        .map_err(|e| format!("could not start Lightroom archive finalization: {e}"))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn spawn_finalize(
-    _finalization: lcc_engine::lightroom_job::LightroomArchiveFinalization,
-    _tx: mpsc::Sender<Message>,
-    _ctx: egui::Context,
-) -> Result<(), String> {
-    unsupported_wasm().map(|_| ())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -240,6 +248,9 @@ fn inspect_report(data: lcc_engine::lightroom_catalog::CatalogImport) -> Value {
 
 /// The task is over: keep its result (with the catalog's `path`) for `status` and say how it went.
 fn terminal(app: &mut LccApp, ctx: &egui::Context, task: &LightroomTask, mut value: Value) {
+    if matches!(task.kind, Kind::Import) {
+        app.session.catalog.set_import_folders(Default::default());
+    }
     let kind = task.kind;
     if let Some(o) = value.as_object_mut() {
         o.entry("path").or_insert_with(|| json!(task.path));
@@ -247,7 +258,7 @@ fn terminal(app: &mut LccApp, ctx: &egui::Context, task: &LightroomTask, mut val
             o.entry("library").or_insert_with(|| json!(library.dir.to_string_lossy()));
         }
     }
-    let message = if let Some(e) = value.get("error").and_then(Value::as_str) {
+    let mut message = if let Some(e) = value.get("error").and_then(Value::as_str) {
         let warning = value.get("indexWarning").and_then(Value::as_str).map_or(String::new(), |w| format!("; index warning: {w}"));
         if matches!(kind, Kind::Inspect) {
             crate::i18n::tr_format!("Lightroom inspection failed: {e}{warning}", e = e, warning = warning)
@@ -283,7 +294,11 @@ fn terminal(app: &mut LccApp, ctx: &egui::Context, task: &LightroomTask, mut val
             crate::i18n::tr_format!("Lightroom import complete: {imported} photos added, {failed} failed", imported = imported, failed = failed)
         }
     };
-    if matches!(kind, Kind::Import) && value.get("cancelled") != Some(&Value::Bool(true)) {
+    let retained = value.get("report").and_then(|r| r.get("imported")).and_then(Value::as_u64).unwrap_or(0);
+    if retained > 0 && (value.get("error").is_some() || value.get("cancelled") == Some(&Value::Bool(true))) {
+        message.push_str(&format!("; {retained} already imported photos remain in the library"));
+    }
+    if matches!(kind, Kind::Import) && (retained > 0 || value.get("cancelled") != Some(&Value::Bool(true))) {
         app.lightroom_result = Some(result_dialog(&value, &message));
         show_result(app);
     }
@@ -357,9 +372,14 @@ fn start_import(app: &mut LccApp, path: PathBuf, update_existing: bool, ctx: &eg
     let cancel = Arc::new(AtomicBool::new(false));
     let progress = job.progress();
     let (tx, rx) = mpsc::channel();
-    spawn_prepare(job, cancel.clone(), tx, ctx.clone())?;
+    let priority = lcc_engine::lightroom_job::LightroomPriority::default();
+    update_location(&priority, &app.session);
+    spawn_prepare(job, priority.clone(), cancel.clone(), tx, ctx.clone())?;
     app.lightroom_last = None;
     app.lightroom = Some(LightroomTask::new(&app.session, Kind::Import, path.clone(), cancel, progress, rx));
+    if let Some(task) = &mut app.lightroom {
+        task.priority = priority;
+    }
     Ok(json!({"running": true, "kind": "import", "path": path}))
 }
 
@@ -403,6 +423,7 @@ pub fn command(app: &mut LccApp, id: &str, p: &Value, ctx: &egui::Context) -> Re
 pub fn tick(app: &mut LccApp, ctx: &egui::Context) {
     show_result(app);
     let Some(mut task) = app.lightroom.take() else { return };
+    update_location(&task.priority, &app.session);
     let message = match task.rx.try_recv() {
         Ok(m) => m,
         Err(mpsc::TryRecvError::Empty) => {
@@ -411,93 +432,64 @@ pub fn tick(app: &mut LccApp, ctx: &egui::Context) {
             return;
         }
         Err(mpsc::TryRecvError::Disconnected) => {
-            terminal(app, ctx, &task, json!({"error": "Lightroom worker stopped unexpectedly"}));
+            terminal(app, ctx, &task, json!({"error": "Lightroom worker stopped unexpectedly", "report": task.partial}));
             return;
         }
     };
     // The task's cancel flag says whether it was cancelled (the worker only stops for it), not an
     // error's words: a real failure that mentions "cancelled" is still reported as a failure.
     match message {
+        Message::Folders(folders, token, ack) => {
+            if task.cancel.load(Ordering::Relaxed) || !token.matches(&app.session) {
+                let _ = ack.send(Err("Lightroom import cancelled or library changed".into()));
+            } else {
+                app.session.catalog.set_import_folders(folders);
+                let _ = ack.send(Ok(()));
+            }
+            app.lightroom = Some(task);
+            ctx.request_repaint();
+        }
         Message::Inspected(result) => match result {
             Ok(report) if !task.cancel.load(Ordering::Relaxed) => terminal(app, ctx, &task, report),
             Ok(_) => terminal(app, ctx, &task, json!({"cancelled": true})),
             Err(_) if task.cancel.load(Ordering::Relaxed) => terminal(app, ctx, &task, json!({"cancelled": true})),
             Err(e) => terminal(app, ctx, &task, json!({"error": e})),
         },
-        Message::Prepared(result) => {
-            let prepared = match result {
-                Ok(p) => p,
-                Err(_) if task.cancel.load(Ordering::Relaxed) => {
-                    terminal(app, ctx, &task, json!({"cancelled": true}));
-                    return;
-                }
-                Err(e) => {
-                    terminal(app, ctx, &task, json!({"error": e}));
-                    return;
-                }
-            };
-            if task.cancel.load(Ordering::Relaxed) || prepared.is_cancelled() || !prepared.token().matches(&app.session) {
+        Message::Batch(prepared, ack) => {
+            if task.cancel.load(Ordering::Relaxed) || !prepared.token().matches(&app.session) {
                 prepared.rollback();
-                terminal(
-                    app,
-                    ctx,
-                    &task,
-                    if task.cancel.load(Ordering::Relaxed) {
-                        json!({"cancelled": true})
-                    } else {
-                        json!({"error": "Lightroom import belongs to a different open library"})
-                    },
-                );
+                let _ = ack.send(Err("Lightroom import cancelled or library changed".into()));
+                app.lightroom = Some(task);
                 return;
             }
             task.enter(Phase::Committing);
-            let mut finalization = None;
-            let mut report = None;
-            let committed = app.session.execute_fn("library.importLightroom", |s| {
-                let completion = lcc_engine::lightroom_job::commit_prepared(s, *prepared)?;
-                report = Some(completion.report.clone());
-                finalization = Some(completion.finalization);
-                Ok(completion.report)
+            let mut completion = None;
+            let result = app.session.execute_fn("library.importLightroom", |s| {
+                let done = lcc_engine::lightroom_job::commit_prepared(s, *prepared)?;
+                let report = done.report.clone();
+                completion = Some(done);
+                Ok(report)
             });
-            let report = report.unwrap_or(Value::Null);
-            task.enter(Phase::Finalizing);
-            let (tx, rx) = mpsc::channel();
-            let commit_error = committed.as_ref().err().map(ToString::to_string);
-            let Some(finalization) = finalization else {
-                terminal(app, ctx, &task, json!({"error": commit_error.clone().unwrap_or_else(|| "Lightroom import did not commit".into())}));
-                return;
-            };
-            if let Err(e) = spawn_finalize(finalization, tx, ctx.clone()) {
-                let mut result = json!({"report": report, "indexWarning": e});
-                if let Some(error) = commit_error {
-                    result["error"] = json!(error);
-                }
-                terminal(app, ctx, &task, result);
-                return;
+            if let Some(done) = completion {
+                merge_report(&mut task.partial, &done.report);
+                let resume = lcc_engine::lightroom_job::LightroomResume::new(&mut app.session, done).map_err(|e| e.to_string());
+                let _ = ack.send(match result {
+                    Ok(_) => resume,
+                    Err(e) => Err(e.to_string()),
+                });
+            } else {
+                let _ = ack.send(Err(result.err().map_or_else(|| "Lightroom import did not commit".into(), |e| e.to_string())));
             }
-            task.rx = rx;
-            task.cancelled = false;
-            let mut pending = json!({"running": true, "kind": "import", "report": report});
-            if let Some(error) = commit_error {
-                pending["error"] = json!(error);
-            }
-            app.lightroom_last = Some(pending);
+            task.enter(Phase::Reading);
             app.lightroom = Some(task);
         }
-        Message::Finalized(result) => {
-            let pending = app.lightroom_last.take().unwrap_or(Value::Null);
-            let report = pending.get("report").cloned().unwrap_or(Value::Null);
-            match result {
-                Ok(()) if pending.get("error").is_none() => terminal(app, ctx, &task, report),
-                Ok(()) => terminal(app, ctx, &task, json!({"report": report, "error": pending["error"].clone()})),
-                Err(e) => {
-                    let mut value = json!({"report": report, "indexWarning": e});
-                    if let Some(error) = pending.get("error") {
-                        value["error"] = error.clone();
-                    }
-                    terminal(app, ctx, &task, value);
-                }
-            }
+        Message::Finished(result) => {
+            let value = match result {
+                Ok(()) => task.partial.clone(),
+                Err(_) if task.cancel.load(Ordering::Relaxed) => json!({"cancelled": true, "report": task.partial}),
+                Err(e) => json!({"error": e, "report": task.partial}),
+            };
+            terminal(app, ctx, &task, value);
         }
     }
     ctx.request_repaint();
@@ -535,6 +527,32 @@ mod tests {
         (task, tx, cancel, progress)
     }
 
+    #[test]
+    fn lightroom_announced_folders_are_selectable_before_photos_and_cleared_on_failure() {
+        let mut h = demo();
+        let (task, tx, _, _) = fake_import(&h);
+        let job = lcc_engine::lightroom_job::LightroomJob::new(&mut h.app.session, PathBuf::new(), false).unwrap();
+        let (ack, rx) = mpsc::channel();
+        let initial = h.app.session.catalog.len();
+        h.app.lightroom = Some(task);
+        tx.send(Message::Folders(["/offline/a".into(), "/offline/b".into()].into(), job.token().clone(), ack)).unwrap();
+        tick(&mut h.app, &h.view.ctx);
+        assert!(rx.recv().unwrap().is_ok());
+        assert_eq!(h.app.session.catalog.len(), initial, "manifest is not a fake imported photo");
+        let folders = h.app.caches.folder_tree(&h.app.session.catalog);
+        assert!(serde_json::to_string(&folders).unwrap().contains("/offline/b"));
+        h.app.session.execute("library.source", &json!({"kind":"libraryFolder", "path":"/offline/b"})).unwrap();
+        assert!(h.app.session.visible().is_empty());
+        assert_eq!(h.app.session.source, lcc_engine::LibrarySource::LibraryFolder);
+        update_location(&h.app.lightroom.as_ref().unwrap().priority, &h.app.session);
+        let serialized = serde_json::to_string(&h.app.session.catalog).unwrap();
+        assert!(!serialized.contains("/offline/b"), "pending folders must not survive an interrupted import as library data");
+        tx.send(Message::Finished(Err("read failed".into()))).unwrap();
+        tick(&mut h.app, &h.view.ctx);
+        assert!(!h.app.session.catalog.has_import_folders());
+        assert!(h.app.session.execute("library.source", &json!({"kind":"libraryFolder", "path":"/offline/b"})).is_err());
+    }
+
     fn demo() -> crate::headless::Headless {
         let app = crate::LccApp::new(lcc_engine::Session::with_demo(), crate::Services { png: None, ..Default::default() });
         let mut h = crate::headless::Headless::new(app, [1200.0, 800.0], 1.0);
@@ -561,7 +579,7 @@ mod tests {
         assert!(!row.cancellable, "once photos are being added it runs to the end");
         assert!(h.app.session.activity.cancel(row.id).is_err());
         assert!(!cancel.load(Ordering::Relaxed));
-        tx.send(Message::Finalized(Ok(()))).unwrap();
+        tx.send(Message::Finished(Ok(()))).unwrap();
         h.step();
         assert!(h.app.lightroom.is_none());
         assert!(h.app.session.activity.list().is_empty(), "the row goes with the task");
@@ -576,10 +594,10 @@ mod tests {
         let id = h.app.session.activity.list()[0].id;
         h.app.session.activity.cancel(id).unwrap();
         assert!(cancel.load(Ordering::Relaxed), "the worker sees the stack's ✕");
-        tx.send(Message::Prepared(Err("cancelled".into()))).unwrap();
+        tx.send(Message::Finished(Err("cancelled".into()))).unwrap();
         h.step();
         assert!(h.app.lightroom.is_none());
-        assert_eq!(h.app.lightroom_last, Some(serde_json::json!({"cancelled": true, "path": "fixture.lrcat"})));
+        assert_eq!(h.app.lightroom_last, Some(serde_json::json!({"cancelled": true, "path": "fixture.lrcat", "report": {}})));
         assert!(h.app.session.activity.list().is_empty());
     }
 
@@ -591,12 +609,12 @@ mod tests {
         let (task, tx, cancel, _) = fake_import(&h);
         h.app.lightroom = Some(task);
         cancel.store(true, Ordering::Relaxed);
-        tx.send(Message::Prepared(Err("Lightroom-Import abgebrochen".into()))).unwrap();
+        tx.send(Message::Finished(Err("Lightroom-Import abgebrochen".into()))).unwrap();
         h.step();
-        assert_eq!(h.app.lightroom_last, Some(serde_json::json!({"cancelled": true, "path": "fixture.lrcat"})));
+        assert_eq!(h.app.lightroom_last, Some(serde_json::json!({"cancelled": true, "path": "fixture.lrcat", "report": {}})));
 
         for message in
-            [Message::Prepared(Err("the drive was ejected: copy cancelled by the system".into())), Message::Inspected(Err("cancelled".into()))]
+            [Message::Finished(Err("the drive was ejected: copy cancelled by the system".into())), Message::Inspected(Err("cancelled".into()))]
         {
             let (task, tx, _, _) = fake_import(&h);
             h.app.lightroom = Some(task);
@@ -670,6 +688,22 @@ mod tests {
     }
 
     #[test]
+    fn lightroom_cancel_reports_retained_batches() {
+        let mut h = demo();
+        let (mut task, tx, cancel, _) = fake_import(&h);
+        merge_report(&mut task.partial, &json!({"imported": 16, "photos": 16, "mapping": {"1": 1}, "missing": [], "failed": []}));
+        merge_report(&mut task.partial, &json!({"imported": 4, "mapping": {"2": 2}, "warnings": ["source warning"]}));
+        assert_eq!(task.status()["imported"], 20);
+        h.app.lightroom = Some(task);
+        cancel.store(true, Ordering::Relaxed);
+        tx.send(Message::Finished(Err("cancelled".into()))).unwrap();
+        h.step();
+        assert_eq!(h.app.lightroom_last.as_ref().unwrap()["report"]["imported"], 20);
+        assert!(h.app.ui.toast.as_ref().unwrap().0.contains("20 already imported"));
+        assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::LightroomResult { .. })));
+    }
+
+    #[test]
     fn inspect_report_keeps_empty_catalog_shape() {
         let report = inspect_report(CatalogImport {
             source: "synthetic.lrcat".into(),
@@ -685,4 +719,57 @@ mod tests {
         assert_eq!(report["missing"], serde_json::json!([]));
         assert_eq!(report["warnings"], serde_json::json!(["warning"]));
     }
+}
+
+fn update_location(priority: &lcc_engine::lightroom_job::LightroomPriority, s: &lcc_engine::Session) {
+    let folder = match s.source {
+        lcc_engine::LibrarySource::Folder => s.browse.as_ref().map(|b| b.path.as_str()),
+        lcc_engine::LibrarySource::LibraryFolder => s.library_folder.as_deref(),
+        _ => s.filter.library_folder.as_deref(),
+    };
+    let active = s.active().and_then(|id| s.catalog.photo(id)).and_then(|p| match &p.source {
+        lcc_catalog::Source::File { path } => Some(path.as_str()),
+        _ => None,
+    });
+    priority.location(folder, active);
+}
+
+pub(crate) fn prioritize_visible(app: &LccApp, ids: &std::collections::HashSet<lcc_catalog::PhotoId>) {
+    if let Some(task) = &app.lightroom {
+        task.priority.visible(ids.iter().filter_map(|id| app.session.catalog.photo(*id)).filter_map(|p| match &p.source {
+            lcc_catalog::Source::File { path } => Some(path.clone()),
+            _ => None,
+        }));
+    }
+}
+
+fn merge_report(total: &mut Value, batch: &Value) {
+    let Some(fields) = batch.as_object() else { return };
+    for (key, value) in fields {
+        match key.as_str() {
+            "imported" | "historySteps" | "snapshots" | "preservedExistingEdits" => {
+                total[key] = json!(total[key].as_u64().unwrap_or(0).saturating_add(value.as_u64().unwrap_or(0)));
+            }
+            "missing" | "failed" | "warnings" => {
+                if !total[key].is_array() {
+                    total[key] = json!([]);
+                }
+                if let (Some(to), Some(from)) = (total[key].as_array_mut(), value.as_array()) {
+                    to.extend(from.iter().cloned());
+                }
+            }
+            "mapping" | "unmapped" => {
+                if !total[key].is_object() {
+                    total[key] = json!({});
+                }
+                if let (Some(to), Some(from)) = (total[key].as_object_mut(), value.as_object()) {
+                    to.extend(from.clone());
+                }
+            }
+            _ => {
+                total[key] = value.clone();
+            }
+        }
+    }
+    total["photos"] = json!(total["mapping"].as_object().map_or(0, |m| m.len()));
 }

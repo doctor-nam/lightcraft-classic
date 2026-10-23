@@ -89,6 +89,14 @@ pub(crate) fn find_sidecar_for_import(stems: &ImportStems, naming: SidecarNaming
     sidecar_candidates(original, SidecarNaming::Full).filter(|p| !shared.contains(p)).find(|p| p.is_file())
 }
 
+fn sidecar_file_stat(original: &str, naming: SidecarNaming) -> Option<SidecarStat> {
+    // Reuse the metadata from the successful candidate instead of a second SMB stat.
+    let m = sidecar_candidates(original, naming).find_map(|p| std::fs::metadata(p).ok().filter(|m| m.is_file()))?;
+    let mtime =
+        m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).and_then(|d| i64::try_from(d.as_secs()).ok()).unwrap_or(0);
+    Some(SidecarStat { mtime, size: m.len() })
+}
+
 /// The names `original`'s sidecar can have, in the order they are looked for: under `naming`,
 /// then under the other naming (the full name also with the photo extension in the other case),
 /// each as `.xmp`, `.XMP` and `.Xmp`.
@@ -617,7 +625,7 @@ impl GpsOnSave {
 }
 
 /// Key of the stem sidecar a file maps to (case-insensitive).
-fn stem_key(original: &str) -> String {
+pub(crate) fn stem_key(original: &str) -> String {
     sidecar_path(original, SidecarNaming::Stem).to_string_lossy().to_lowercase()
 }
 
@@ -1038,11 +1046,7 @@ impl Session {
     fn sidecar_stat_named(&self, id: PhotoId, naming: SidecarNaming) -> Option<SidecarStat> {
         let p = self.catalog.photo(id)?;
         let orig = file_path(p)?;
-        let f = find_sidecar(orig, naming)?;
-        let m = std::fs::metadata(f).ok()?;
-        let mtime =
-            m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).and_then(|d| i64::try_from(d.as_secs()).ok()).unwrap_or(0);
-        Some(SidecarStat { mtime, size: m.len() })
+        sidecar_file_stat(orig, naming)
     }
 
     /// The metadata-vs-XMP state of photo `id` (see [`lcc_catalog::xmp_state`]).
@@ -1058,8 +1062,10 @@ impl Session {
     /// With `only_with_sidecar`, photos without a sidecar file are skipped.
     pub(crate) fn record_xmp_stamps(&mut self, ids: &[PhotoId], only_with_sidecar: bool) {
         let namings = self.sidecar_namings(ids);
-        for (id, naming) in ids.iter().zip(namings) {
-            let stat = self.sidecar_stat_named(*id, naming);
+        let files: Vec<_> =
+            ids.iter().zip(namings).map(|(id, naming)| (self.catalog.photo(*id).and_then(|p| file_path(p)).map(str::to_owned), naming)).collect();
+        let stats = crate::import_io::map(&files, |(path, naming)| path.as_deref().and_then(|p| sidecar_file_stat(p, *naming)));
+        for (id, stat) in ids.iter().zip(stats) {
             if only_with_sidecar && stat.is_none() {
                 continue;
             }

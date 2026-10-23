@@ -343,6 +343,10 @@ pub enum Op {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
+    /// Folders announced by an in-flight import, without claiming their photos are loaded.
+    /// Transient: never persisted as library contents.
+    #[serde(skip)]
+    import_folders: Arc<std::collections::BTreeSet<String>>,
     photos: BTreeMap<PhotoId, Arc<Photo>>,
     albums: BTreeMap<AlbumId, Album>,
     next_photo: u64,

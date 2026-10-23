@@ -457,7 +457,7 @@ pub fn specs() -> Vec<CommandSpec> {
                         }
                         let f = Filter { library_folder: Some(path.to_string()), ..Default::default() };
                         let ids = s.catalog.query(&f, &Sort::default());
-                        if ids.is_empty() {
+                        if ids.is_empty() && !s.catalog.has_import_folder(path) {
                             return Err(bad("library.source", format!("{path}: no photo in the library was imported from it")));
                         }
                         if covers_other_disks(s, path, &ids) {

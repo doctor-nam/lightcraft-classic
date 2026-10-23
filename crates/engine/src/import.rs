@@ -1057,11 +1057,19 @@ impl ImportJob {
             library.as_ref(),
             todo.iter().zip(&probed).filter_map(|(path, info)| info.as_ref().ok().map(|i| (path.as_str(), i.kind))),
         );
+        // Samba metadata round trips must not serialize the batch. Preserve the same
+        // candidate order and RAW/JPEG ownership for each file, including embedded fallback.
+        let packets = crate::import_io::map(&todo.iter().zip(&probed).collect::<Vec<_>>(), |(path, info)| {
+            if cancel.load(Relaxed) || info.is_err() {
+                return None;
+            }
+            crate::sidecar::find_sidecar_for_import(&stems, self.naming, path).and_then(|f| std::fs::read_to_string(f).ok())
+        });
         // Files are planned one by one, in order (duplicates, sidecars, names, folders); their
         // copies or moves — the slow part, reading and writing every byte and verifying it — are
         // collected and run on several threads (issue #367), then their outcomes take their places.
         let mut plan = Plan::default();
-        for (path, info) in todo.into_iter().zip(probed) {
+        for ((path, info), packet) in todo.into_iter().zip(probed).zip(packets) {
             if cancel.load(Relaxed) {
                 break;
             }
@@ -1095,9 +1103,7 @@ impl ImportJob {
             // the XMP sidecar (or a raw's embedded XMP), read before copying: its capture time files
             // and names the copy when the file itself has none
             let raw = info.kind == MediaKind::Raw;
-            let packet = crate::sidecar::find_sidecar_for_import(&stems, self.naming, &path)
-                .and_then(|f| std::fs::read_to_string(f).ok())
-                .or_else(|| info.xmp.clone().filter(|_| raw));
+            let packet = packet.or_else(|| info.xmp.clone().filter(|_| raw));
             let target = crate::crs::Target::for_file(info.kind, &info.format, info.preview_only.is_some(), &info.meta.camera);
             let sidecar = packet.and_then(|x| match crate::sidecar::parse_sidecar(&x, target) {
                 Ok(sc) => Some(sc),
